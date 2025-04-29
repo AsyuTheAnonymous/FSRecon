@@ -47,7 +47,7 @@ stdenv.mkDerivation {
   meta = with lib; {
     description = "A modular domain reconnaissance framework";
     # Replace with your repository URL if you plan to share this
-    homepage = "https://github.com/AsyuSenpai/FSRecon";
+    homepage = "https://github.com/AsyuTheAnonymous/FSRecon";
     license = licenses.free; # Or choose an appropriate license for your script
     platforms = platforms.linux;
     maintainers = [];
