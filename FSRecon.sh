@@ -46,7 +46,7 @@ VULN_SCANNER="nuclei"           # Options: nuclei
 NMAP_OPTIONS="-F"               # -F for fast scan, -p- for all ports, etc.
 SUBFINDER_OPTIONS="-silent"     # Additional subfinder options
 GOBUSTER_OPTIONS="-q"           # Additional gobuster options
-HTTPX_OPTIONS="-silent -status-code -tech-detect -title" # Additional httpx options
+HTTPX_OPTIONS="-silent -no-color" # Base options for httpx, details controlled in function
 GOWITNESS_OPTIONS=""            # Additional gowitness options (e.g., --disable-db)
 NUCLEI_OPTIONS="-silent -severity medium,high,critical" # Default nuclei options (e.g., add -t /path/to/templates)
 # NUCLEI_TEMPLATES_DIR="/path/to/nuclei-templates" # Uncomment and set if using custom/specific templates
@@ -191,7 +191,8 @@ probe_http() {
     local domain=$1
     local domain_dir=$2
     local subdomain_file="$domain_dir/subdomains.txt"
-    local live_hosts_file="$domain_dir/live_hosts.txt"
+    local live_hosts_file="$domain_dir/live_hosts.txt" # Plain URL list
+    local live_hosts_details_json="$domain_dir/live_hosts_details.json" # Detailed JSON output
     
     echo "[+] Probing discovered subdomains for live web servers..."
     echo "## LIVE WEB HOSTS" >> "$SUMMARY_FILE"
@@ -205,10 +206,14 @@ probe_http() {
     case $HTTP_PROBER in
         "httpx")
             # Add the base domain itself to the list for probing
+            # Output plain URLs to live_hosts.txt
             echo "$domain" | cat - "$subdomain_file" | httpx $HTTPX_OPTIONS -o "$live_hosts_file"
+
+            # Output detailed JSON to live_hosts_details.json and suppress stdout
+            echo "$domain" | cat - "$subdomain_file" | httpx $HTTPX_OPTIONS -json -o "$live_hosts_details_json" > /dev/null 2>&1
             ;;
         "httprobe")
-            # Example httprobe command - adjust as needed
+            # Example httprobe command - adjust as needed (doesn't support JSON details easily)
             cat "$subdomain_file" | httprobe -c 50 > "$live_hosts_file"
             ;;
         *)
@@ -226,7 +231,10 @@ probe_http() {
     fi
     
     echo "" >> "$SUMMARY_FILE"
-    echo "Full live hosts list available at: $live_hosts_file" >> "$SUMMARY_FILE"
+    echo "Plain list of live hosts available at: $live_hosts_file" >> "$SUMMARY_FILE"
+    if [ -f "$live_hosts_details_json" ] && [ -s "$live_hosts_details_json" ]; then
+        echo "Detailed JSON output available at: $live_hosts_details_json" >> "$SUMMARY_FILE"
+    fi
     echo "" >> "$SUMMARY_FILE"
 }
 
@@ -373,8 +381,9 @@ scan_paths() {
         esac
         
         # Append results to main file and summary
+        local count=0 # Initialize count
         if [ -f "$temp_output" ] && [ -s "$temp_output" ]; then
-            local count=$(wc -l < "$temp_output")
+            count=$(wc -l < "$temp_output")
             echo "  Found $count paths on $target_url"
             echo "### Paths for $target_url ###" >> "$paths_output_file"
             cat "$temp_output" >> "$paths_output_file"
