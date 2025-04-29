@@ -38,11 +38,18 @@ OUTPUT_BASE_DIR="fsr_results"
 PORT_SCANNER="nmap"             # Options: nmap, masscan, etc.
 SUBDOMAIN_SCANNER="subfinder"   # Options: subfinder, amass, etc.
 PATH_SCANNER="gobuster"         # Options: gobuster, dirb, dirsearch, etc.
+HTTP_PROBER="httpx"             # Options: httpx, httprobe, etc.
+SCREENSHOT_TOOL="gowitness"     # Options: gowitness, aquatone, etc.
+VULN_SCANNER="nuclei"           # Options: nuclei
 
 # Tool options
 NMAP_OPTIONS="-F"               # -F for fast scan, -p- for all ports, etc.
 SUBFINDER_OPTIONS="-silent"     # Additional subfinder options
 GOBUSTER_OPTIONS="-q"           # Additional gobuster options
+HTTPX_OPTIONS="-silent -status-code -tech-detect -title" # Additional httpx options
+GOWITNESS_OPTIONS=""            # Additional gowitness options (e.g., --disable-db)
+NUCLEI_OPTIONS="-silent -severity medium,high,critical" # Default nuclei options (e.g., add -t /path/to/templates)
+# NUCLEI_TEMPLATES_DIR="/path/to/nuclei-templates" # Uncomment and set if using custom/specific templates
 
 # Wordlists
 DIR_WORDLIST="$WORDLIST_DIR/directories/directory-list-2.3-medium.txt"
@@ -54,7 +61,10 @@ DIR_WORDLIST="$WORDLIST_DIR/directories/directory-list-2.3-medium.txt"
 SCAN_PORTS=true                 # Set to 'false' to skip port scanning
 SCAN_SUBDOMAINS=true            # Set to 'false' to skip subdomain enumeration
 SCAN_PATHS=true                 # Set to 'false' to skip path discovery
-HTTP_PROTOCOL="http"            # Options: http, https
+SCAN_HTTP_PROBE=true            # Set to 'false' to skip HTTP probing
+SCAN_SCREENSHOTS=true           # Set to 'false' to skip screenshotting
+SCAN_VULNERABILITIES=true       # Set to 'false' to skip vulnerability scanning
+HTTP_PROTOCOL="http"            # Default protocol for path scanning if not probing
 
 # =============================================
 # FUNCTION DEFINITIONS
@@ -74,6 +84,18 @@ check_requirements() {
     
     if [ "$SCAN_PATHS" = true ] && ! command -v $PATH_SCANNER &> /dev/null; then
         missing_tools+=("$PATH_SCANNER")
+    fi
+
+    if [ "$SCAN_HTTP_PROBE" = true ] && ! command -v $HTTP_PROBER &> /dev/null; then
+        missing_tools+=("$HTTP_PROBER")
+    fi
+
+    if [ "$SCAN_SCREENSHOTS" = true ] && ! command -v $SCREENSHOT_TOOL &> /dev/null; then
+        missing_tools+=("$SCREENSHOT_TOOL")
+    fi
+
+    if [ "$SCAN_VULNERABILITIES" = true ] && ! command -v $VULN_SCANNER &> /dev/null; then
+        missing_tools+=("$VULN_SCANNER")
     fi
     
     if [ ${#missing_tools[@]} -ne 0 ]; then
@@ -164,42 +186,221 @@ scan_subdomains() {
     echo "" >> "$SUMMARY_FILE"
 }
 
+# HTTP/HTTPS Probing function
+probe_http() {
+    local domain=$1
+    local domain_dir=$2
+    local subdomain_file="$domain_dir/subdomains.txt"
+    local live_hosts_file="$domain_dir/live_hosts.txt"
+    
+    echo "[+] Probing discovered subdomains for live web servers..."
+    echo "## LIVE WEB HOSTS" >> "$SUMMARY_FILE"
+    
+    if [ ! -f "$subdomain_file" ] || [ ! -s "$subdomain_file" ]; then
+        echo "Subdomain file ($subdomain_file) not found or empty. Skipping HTTP probing." >> "$SUMMARY_FILE"
+        echo "" >> "$SUMMARY_FILE"
+        return
+    fi
+    
+    case $HTTP_PROBER in
+        "httpx")
+            # Add the base domain itself to the list for probing
+            echo "$domain" | cat - "$subdomain_file" | httpx $HTTPX_OPTIONS -o "$live_hosts_file"
+            ;;
+        "httprobe")
+            # Example httprobe command - adjust as needed
+            cat "$subdomain_file" | httprobe -c 50 > "$live_hosts_file"
+            ;;
+        *)
+            echo "Unsupported HTTP prober: $HTTP_PROBER" >> "$SUMMARY_FILE"
+            ;;
+    esac
+    
+    # Count and list live hosts for the summary
+    if [ -f "$live_hosts_file" ] && [ -s "$live_hosts_file" ]; then
+        LIVE_HOST_COUNT=$(wc -l < "$live_hosts_file")
+        echo "Found $LIVE_HOST_COUNT live web hosts:" >> "$SUMMARY_FILE"
+        cat "$live_hosts_file" >> "$SUMMARY_FILE"
+    else
+        echo "No live web hosts found." >> "$SUMMARY_FILE"
+    fi
+    
+    echo "" >> "$SUMMARY_FILE"
+    echo "Full live hosts list available at: $live_hosts_file" >> "$SUMMARY_FILE"
+    echo "" >> "$SUMMARY_FILE"
+}
+
+# Screenshotting function
+take_screenshots() {
+    local domain_dir=$1
+    local live_hosts_file="$domain_dir/live_hosts.txt"
+    local screenshot_dir="$domain_dir/screenshots"
+    
+    echo "[+] Taking screenshots of live web hosts..."
+    echo "## SCREENSHOTS" >> "$SUMMARY_FILE"
+    
+    if [ ! -f "$live_hosts_file" ] || [ ! -s "$live_hosts_file" ]; then
+        echo "Live hosts file ($live_hosts_file) not found or empty. Skipping screenshotting." >> "$SUMMARY_FILE"
+        echo "" >> "$SUMMARY_FILE"
+        return
+    fi
+    
+    mkdir -p "$screenshot_dir"
+    
+    case $SCREENSHOT_TOOL in
+        "gowitness")
+            # Gowitness needs URLs, extract from httpx output if needed
+            # Assuming live_hosts.txt contains one URL per line (may need adjustment based on httpx output format)
+            gowitness file -f "$live_hosts_file" -d "$screenshot_dir" --no-redirect $GOWITNESS_OPTIONS > /dev/null 2>&1
+            ;;
+        "aquatone")
+            # Example aquatone command - adjust as needed
+            # Aquatone might need specific input format
+            cat "$live_hosts_file" | aquatone -out "$screenshot_dir" > /dev/null 2>&1
+            ;;
+        *)
+            echo "Unsupported screenshot tool: $SCREENSHOT_TOOL" >> "$SUMMARY_FILE"
+            ;;
+    esac
+    
+    # Check if screenshots were generated (basic check)
+    if [ -d "$screenshot_dir" ] && [ "$(ls -A $screenshot_dir)" ]; then
+        echo "Screenshots saved in: $screenshot_dir" >> "$SUMMARY_FILE"
+        # Optionally generate an HTML report if the tool supports it
+        if [ "$SCREENSHOT_TOOL" = "gowitness" ]; then
+             gowitness report generate -d "$screenshot_dir" > /dev/null 2>&1
+             echo "Gowitness report generated in: $screenshot_dir/report.html" >> "$SUMMARY_FILE"
+        fi
+    else
+        echo "No screenshots were generated or the directory is empty." >> "$SUMMARY_FILE"
+    fi
+    
+    echo "" >> "$SUMMARY_FILE"
+}
+
+# Vulnerability scanning function
+scan_vulnerabilities() {
+    local domain_dir=$1
+    local live_hosts_file="$domain_dir/live_hosts.txt"
+    local vuln_output_file="$domain_dir/vulnerabilities.txt"
+    
+    echo "[+] Scanning live hosts for vulnerabilities..."
+    echo "## VULNERABILITIES (Nuclei Scan)" >> "$SUMMARY_FILE"
+    
+    if [ ! -f "$live_hosts_file" ] || [ ! -s "$live_hosts_file" ]; then
+        echo "Live hosts file ($live_hosts_file) not found or empty. Skipping vulnerability scanning." >> "$SUMMARY_FILE"
+        echo "" >> "$SUMMARY_FILE"
+        return
+    fi
+    
+    # Prepare Nuclei command
+    local nuclei_cmd="$VULN_SCANNER -l \"$live_hosts_file\" -o \"$vuln_output_file\" $NUCLEI_OPTIONS"
+    
+    # Add template directory if specified
+    if [ -n "$NUCLEI_TEMPLATES_DIR" ]; then
+        nuclei_cmd+=" -t \"$NUCLEI_TEMPLATES_DIR\""
+    fi
+    
+    # Execute Nuclei
+    eval $nuclei_cmd > /dev/null 2>&1
+    
+    # Summarize results
+    if [ -f "$vuln_output_file" ] && [ -s "$vuln_output_file" ]; then
+        VULN_COUNT=$(wc -l < "$vuln_output_file")
+        echo "Found $VULN_COUNT potential vulnerabilities/findings:" >> "$SUMMARY_FILE"
+        # Add first few lines to summary for quick view (optional)
+        head -n 10 "$vuln_output_file" >> "$SUMMARY_FILE"
+        if [ $VULN_COUNT -gt 10 ]; then
+            echo "..." >> "$SUMMARY_FILE"
+            echo "(See full list below)" >> "$SUMMARY_FILE"
+        fi
+        echo "" >> "$SUMMARY_FILE" # Separator
+        cat "$vuln_output_file" >> "$SUMMARY_FILE" # Full list
+    else
+        echo "No vulnerabilities found matching the criteria." >> "$SUMMARY_FILE"
+    fi
+    
+    echo "" >> "$SUMMARY_FILE"
+    echo "Full vulnerability scan results available at: $vuln_output_file" >> "$SUMMARY_FILE"
+    echo "" >> "$SUMMARY_FILE"
+}
+
+
 # Path discovery function
 scan_paths() {
     local domain=$1
     local domain_dir=$2
+    local live_hosts_file="$domain_dir/live_hosts.txt" # Expect live hosts file path
+    local paths_output_file="$domain_dir/paths_discovered.txt" # Consolidated output
     
-    echo "[+] Discovering web paths on $domain..."
+    echo "[+] Discovering web paths..."
     echo "## WEB PATHS" >> "$SUMMARY_FILE"
     
-    case $PATH_SCANNER in
-        "gobuster")
-            gobuster dir -u "${HTTP_PROTOCOL}://$domain" -w "$DIR_WORDLIST" $GOBUSTER_OPTIONS -o "$domain_dir/paths.txt" > /dev/null 2>&1
-            ;;
-        "dirb")
-            # Example dirb command - adjust as needed
-            dirb "${HTTP_PROTOCOL}://$domain" "$DIR_WORDLIST" -o "$domain_dir/paths.txt" -S > /dev/null 2>&1
-            ;;
-        "dirsearch")
-            # Example dirsearch command - adjust as needed
-            dirsearch -u "${HTTP_PROTOCOL}://$domain" -w "$DIR_WORDLIST" -o "$domain_dir/paths.txt" --simple-report > /dev/null 2>&1
-            ;;
-        *)
-            echo "Unsupported path scanner: $PATH_SCANNER" >> "$SUMMARY_FILE"
-            ;;
-    esac
-    
-    # Count and list discovered paths for the summary
-    if [ -f "$domain_dir/paths.txt" ] && [ -s "$domain_dir/paths.txt" ]; then
-        PATH_COUNT=$(wc -l < "$domain_dir/paths.txt")
-        echo "Found $PATH_COUNT accessible paths:" >> "$SUMMARY_FILE"
-        cat "$domain_dir/paths.txt" >> "$SUMMARY_FILE"
+    # Determine targets: use live hosts if available, otherwise use base domain
+    local targets=()
+    if [ "$SCAN_HTTP_PROBE" = true ] && [ -f "$live_hosts_file" ] && [ -s "$live_hosts_file" ]; then
+        echo "Scanning paths on live hosts found by HTTP probe."
+        mapfile -t targets < <(cat "$live_hosts_file" | sed 's/ .*//') # Extract URL part if httpx output includes extra info
     else
-        echo "No accessible paths found." >> "$SUMMARY_FILE"
+        echo "HTTP probing skipped or no live hosts found. Scanning base domain: ${HTTP_PROTOCOL}://$domain"
+        targets+=("${HTTP_PROTOCOL}://$domain")
+    fi
+    
+    # Clear previous results if any
+    > "$paths_output_file"
+    
+    local total_paths_found=0
+    
+    for target_url in "${targets[@]}"; do
+        echo "  Scanning paths on: $target_url"
+        local temp_output="${paths_output_file}.tmp"
+        
+        case $PATH_SCANNER in
+            "gobuster")
+                gobuster dir -u "$target_url" -w "$DIR_WORDLIST" $GOBUSTER_OPTIONS -o "$temp_output" > /dev/null 2>&1
+                ;;
+            "dirb")
+                dirb "$target_url" "$DIR_WORDLIST" -o "$temp_output" -S > /dev/null 2>&1
+                ;;
+            "dirsearch")
+                # dirsearch output needs careful handling depending on version/options
+                dirsearch -u "$target_url" -w "$DIR_WORDLIST" --simple-report -o "$temp_output" > /dev/null 2>&1
+                ;;
+            *)
+                echo "Unsupported path scanner: $PATH_SCANNER" >> "$SUMMARY_FILE"
+                continue # Skip to next target
+                ;;
+        esac
+        
+        # Append results to main file and summary
+        if [ -f "$temp_output" ] && [ -s "$temp_output" ]; then
+            local count=$(wc -l < "$temp_output")
+            echo "  Found $count paths on $target_url"
+            echo "### Paths for $target_url ###" >> "$paths_output_file"
+            cat "$temp_output" >> "$paths_output_file"
+            echo "" >> "$paths_output_file"
+            
+            echo "### Paths for $target_url ###" >> "$SUMMARY_FILE"
+            cat "$temp_output" >> "$SUMMARY_FILE"
+            echo "" >> "$SUMMARY_FILE"
+            
+            total_paths_found=$((total_paths_found + count))
+            rm "$temp_output"
+        else
+             echo "  No paths found on $target_url"
+        fi
+    done
+    
+    # Final summary count
+    if [ $total_paths_found -gt 0 ]; then
+        echo "Total accessible paths found across all targets: $total_paths_found" >> "$SUMMARY_FILE"
+    else
+        echo "No accessible paths found across all targets." >> "$SUMMARY_FILE"
     fi
     
     echo "" >> "$SUMMARY_FILE"
-    echo "Full path discovery results available at: $domain_dir/paths.txt" >> "$SUMMARY_FILE"
+    echo "Full path discovery results available at: $paths_output_file" >> "$SUMMARY_FILE"
+    echo "" >> "$SUMMARY_FILE"
 }
 
 # Function to scan a single domain
@@ -222,7 +423,10 @@ scan_domain() {
     # Run selected scans
     [ "$SCAN_PORTS" = true ] && scan_ports "$domain" "$domain_dir"
     [ "$SCAN_SUBDOMAINS" = true ] && scan_subdomains "$domain" "$domain_dir"
-    [ "$SCAN_PATHS" = true ] && scan_paths "$domain" "$domain_dir"
+    [ "$SCAN_HTTP_PROBE" = true ] && probe_http "$domain" "$domain_dir"
+    [ "$SCAN_VULNERABILITIES" = true ] && scan_vulnerabilities "$domain_dir"
+    [ "$SCAN_SCREENSHOTS" = true ] && take_screenshots "$domain_dir"
+    [ "$SCAN_PATHS" = true ] && scan_paths "$domain" "$domain_dir" # Pass domain_dir implicitly containing live_hosts.txt
     
     echo "[+] Reconnaissance completed for $domain"
     echo "[+] Summary report available at: $SUMMARY_FILE"
@@ -242,7 +446,10 @@ generate_master_summary() {
     echo "Scan Configuration:" >> "$MASTER_SUMMARY"
     echo "- Port Scanner: $PORT_SCANNER" >> "$MASTER_SUMMARY"
     echo "- Subdomain Scanner: $SUBDOMAIN_SCANNER" >> "$MASTER_SUMMARY"
-    echo "- Path Scanner: $PATH_SCANNER" >> "$MASTER_SUMMARY"
+    echo "- HTTP Prober: $HTTP_PROBER (Enabled: $SCAN_HTTP_PROBE)" >> "$MASTER_SUMMARY"
+    echo "- Vulnerability Scanner: $VULN_SCANNER (Enabled: $SCAN_VULNERABILITIES)" >> "$MASTER_SUMMARY"
+    echo "- Screenshot Tool: $SCREENSHOT_TOOL (Enabled: $SCAN_SCREENSHOTS)" >> "$MASTER_SUMMARY"
+    echo "- Path Scanner: $PATH_SCANNER (Enabled: $SCAN_PATHS)" >> "$MASTER_SUMMARY"
     echo "" >> "$MASTER_SUMMARY"
     
     echo "Domains scanned:" >> "$MASTER_SUMMARY"
@@ -265,8 +472,11 @@ show_help() {
     echo "  -h, --help                 Show this help message"
     echo "  --no-ports                 Skip port scanning"
     echo "  --no-subdomains            Skip subdomain enumeration"
+    echo "  --no-probe                 Skip HTTP probing"
+    echo "  --no-vulns                 Skip vulnerability scanning"
+    echo "  --no-screenshots           Skip screenshotting"
     echo "  --no-paths                 Skip path discovery"
-    echo "  --protocol <http|https>    Set protocol (default: http)"
+    echo "  --protocol <http|https>    Set default protocol for path scan if not probing (default: http)"
     echo ""
     echo "Example:"
     echo "  $0 --protocol https example.com"
@@ -287,6 +497,18 @@ parse_arguments() {
                 ;;
             --no-subdomains)
                 SCAN_SUBDOMAINS=false
+                shift
+                ;;
+            --no-probe)
+                SCAN_HTTP_PROBE=false
+                shift
+                ;;
+            --no-vulns)
+                SCAN_VULNERABILITIES=false
+                shift
+                ;;
+            --no-screenshots)
+                SCAN_SCREENSHOTS=false
                 shift
                 ;;
             --no-paths)
