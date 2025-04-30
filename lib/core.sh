@@ -3,7 +3,9 @@
 
 # Global variables
 FSRECON_VERSION="2.0.0"
-FSRECON_ROOT="$(dirname "$(dirname "$(readlink -f "$0")")")"
+# Fix the path issue by using the actual script path
+SCRIPT_PATH="${BASH_SOURCE[0]}"
+FSRECON_ROOT="$(cd "$(dirname "$(dirname "$SCRIPT_PATH")")" && pwd)"
 CONFIG_FILE=""
 VERBOSE=false
 
@@ -42,8 +44,16 @@ load_config() {
         key=$(echo "$key" | xargs)
         value=$(echo "$value" | xargs)
         
-        # Expand variables in value
-        eval "value=\"$value\""
+        # Expand variables in value carefully
+        # First, check if the value contains any variable references
+        if [[ "$value" == *'${'*'}'* ]]; then
+            # Make sure CONFIG_FILE is an absolute path to ensure eval works correctly
+            cd "$(dirname "$CONFIG_FILE")" || true
+            # Use eval with a safe pattern
+            # If variable expansion fails, keep the original value
+            eval "expanded_value=\"$value\"" 2>/dev/null || expanded_value="$value"
+            value="$expanded_value"
+        fi
         
         # Create variable name
         if [[ -n "$section" ]]; then
@@ -68,8 +78,21 @@ get_config() {
     local key="$2"
     local default="$3"
     
+    # Make sure section and key are not empty
+    if [[ -z "$section" || -z "$key" ]]; then
+        echo "$default"
+        return 1
+    fi
+    
     local var_name="${section^^}_${key^^}"
-    local value="${!var_name}"
+    
+    # Use parameter expansion with a default to avoid unbound variable errors
+    # ${!name} is an indirect reference, but if name is unbound it fails
+    # We need to check if the variable exists first
+    local value=""
+    if [[ -n "$var_name" ]] && [[ -v "$var_name" ]]; then
+        value="${!var_name}"
+    fi
     
     if [[ -z "$value" && -n "$default" ]]; then
         echo "$default"
@@ -119,16 +142,41 @@ validate_domain() {
 init_fsrecon() {
     # Create output directories if they don't exist
     local output_dir="$(get_config general output_dir "${FSRECON_ROOT}/output")"
+    
+    # Ensure output_dir is not empty
+    if [[ -z "$output_dir" ]]; then
+        output_dir="${FSRECON_ROOT}/output"
+        echo "Warning: Output directory not specified or empty, using default: $output_dir"
+    fi
+    
     mkdir -p "$output_dir"
     
     # Create timestamp for this run
     export FSRECON_TIMESTAMP="$(date +%Y%m%d_%H%M%S)"
     export FSRECON_RUN_DIR="${output_dir}/run_${FSRECON_TIMESTAMP}"
+    
+    # Ensure FSRECON_RUN_DIR is not empty
+    if [[ -z "$FSRECON_RUN_DIR" ]]; then
+        export FSRECON_RUN_DIR="${FSRECON_ROOT}/output/run_${FSRECON_TIMESTAMP}"
+        echo "Warning: Run directory not specified or empty, using default: $FSRECON_RUN_DIR"
+    fi
+    
     mkdir -p "$FSRECON_RUN_DIR"
     
+    # Debug path information
+    echo "Debug: FSRECON_ROOT is set to: ${FSRECON_ROOT}"
+    echo "Debug: Attempting to source logger from: ${FSRECON_ROOT}/lib/logger.sh"
+    
     # Initialize logging
-    source "${FSRECON_ROOT}/lib/logger.sh"
-    init_logger
+    if [[ -f "${FSRECON_ROOT}/lib/logger.sh" ]]; then
+        source "${FSRECON_ROOT}/lib/logger.sh"
+        init_logger
+    else
+        echo "Error: Logger file not found at ${FSRECON_ROOT}/lib/logger.sh"
+        echo "Current working directory: $(pwd)"
+        echo "Script directory: $(dirname "$SCRIPT_PATH")"
+        exit 1
+    fi
     
     log_info "FSRecon v${FSRECON_VERSION} initialized"
     log_debug "Configuration loaded from: $CONFIG_FILE"

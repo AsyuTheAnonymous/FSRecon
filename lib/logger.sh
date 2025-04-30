@@ -2,17 +2,17 @@
 # lib/logger.sh - Logging functionality for FSRecon
 
 # Log levels
-declare -r LOG_LEVEL_DEBUG=0
-declare -r LOG_LEVEL_INFO=1
-declare -r LOG_LEVEL_WARN=2
-declare -r LOG_LEVEL_ERROR=3
+export LOG_LEVEL_DEBUG=0
+export LOG_LEVEL_INFO=1
+export LOG_LEVEL_WARN=2
+export LOG_LEVEL_ERROR=3
 
 # ANSI color codes
-declare -r COLOR_RESET="\033[0m"
-declare -r COLOR_DEBUG="\033[36m"   # Cyan
-declare -r COLOR_INFO="\033[32m"    # Green
-declare -r COLOR_WARN="\033[33m"    # Yellow
-declare -r COLOR_ERROR="\033[31m"   # Red
+export COLOR_RESET="\033[0m"
+export COLOR_DEBUG="\033[36m"   # Cyan
+export COLOR_INFO="\033[32m"    # Green
+export COLOR_WARN="\033[33m"    # Yellow
+export COLOR_ERROR="\033[31m"   # Red
 
 # Global variables
 LOGGER_LEVEL=$LOG_LEVEL_INFO

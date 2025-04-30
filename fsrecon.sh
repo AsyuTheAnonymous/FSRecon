@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # fsrecon.sh - Full Spectrum Recon main script
 
 # Set strict mode
@@ -60,6 +60,7 @@ show_help() {
     echo "  --threads NUM              Set maximum number of threads"
     echo "  --delay SECONDS            Set delay between requests"
     echo "  --rate-limit NUM           Set rate limit (requests per second)"
+    echo "  --report-format FORMAT     Set report format (text, json, html, all)"
     echo ""
     echo "Examples:"
     echo "  $0 example.com                    # Scan example.com with default settings"
@@ -136,6 +137,10 @@ parse_arguments() {
                 export SCANNING_RATE_LIMIT="$2"
                 shift 2
                 ;;
+            --report-format)
+                export REPORTING_FORMAT="$2"
+                shift 2
+                ;;
             -*)
                 echo "Error: Unknown option $1"
                 show_help
@@ -151,7 +156,10 @@ parse_arguments() {
 
 # Initialize FSRecon
 initialize() {
-    # Load configuration
+    # Initialize core systems first
+    init_fsrecon
+    
+    # Now we can use logging functions
     log_debug "Loading configuration from $CONFIG_FILE"
     load_config "$CONFIG_FILE"
     
@@ -164,9 +172,6 @@ initialize() {
     if [[ -n "$OUTPUT_DIR" ]]; then
         export GENERAL_OUTPUT_DIR="$OUTPUT_DIR"
     fi
-    
-    # Initialize core systems
-    init_fsrecon
     
     # Load modules
     load_modules
@@ -304,66 +309,83 @@ process_domain() {
     return 0
 }
 
-# Generate reports
-generate_reports() {
-    log_info "Generating reports"
+# Generate reports for a domain
+generate_domain_reports() {
+    local domain="$1"
+    local domain_dir="${FSRECON_RUN_DIR}/${domain}"
+    local report_format="${REPORTING_FORMAT:-text}"
     
-    # Create summary report
-    local summary_file="${FSRECON_RUN_DIR}/summary_report.txt"
+    log_info "Generating reports for domain: $domain"
     
-    {
-        echo "==============================================="
-        echo "      FULL SPECTRUM RECON REPORT"
-        echo "      Generated on $(date)"
-        echo "==============================================="
-        echo ""
-        echo "Domains scanned:"
-        
-        for domain in "${DOMAINS[@]}"; do
-            echo "- $domain"
-        done
-        
-        echo ""
-        echo "Scan Configuration:"
-        echo "- Port Scanning: $(get_config scanning scan_ports "true")"
-        echo "- Subdomain Enumeration: $(get_config scanning scan_subdomains "true")"
-        echo "- HTTP Probing: $(get_config scanning scan_http "true")"
-        echo "- Path Discovery: $(get_config scanning scan_paths "true")"
-        echo "- Screenshot Capture: $(get_config scanning scan_screenshots "true")"
-        echo "- Vulnerability Scanning: $(get_config scanning scan_vulnerabilities "true")"
-        # Vulnerability results
-        echo '    "vulnerabilities": {'
-        if [[ -f "${domain_dir}/vuln/vulnerabilities.txt" ]]; then
-            echo '      "found": true,'
-            echo '      "count": '"$(wc -l < "${domain_dir}/vuln/vulnerabilities.txt")"','
-            echo '      "data": ['
-        
-            # Convert vulnerabilities to JSON array
-            local first=true
-            while IFS= read -r line || [[ -n "$line" ]]; do
-                [[ -z "$line" ]] && continue
-            
-                if [[ "$first" == true ]]; then
-                    echo '        "'"${line//\"/\\\"}"'"'
-                    first=false
-                else
-                    echo '        ,"'"${line//\"/\\\"}"'"'
-                fi
-            done < "${domain_dir}/vuln/vulnerabilities.txt"
-        
-            echo '      ]'
-        else
-            echo '      "found": false,'
-            echo '      "count": 0,'
-            echo '      "data": []'
-        fi
-        echo '    }'
+    case "${report_format,,}" in
+        "text")
+            generate_text_report "$domain" "${domain_dir}/report.txt"
+            ;;
+        "json")
+            generate_json_report "$domain" "${domain_dir}/report.json"
+            ;;
+        "html")
+            generate_html_report "$domain" "${domain_dir}/report.html"
+            ;;
+        "all")
+            generate_text_report "$domain" "${domain_dir}/report.txt"
+            generate_json_report "$domain" "${domain_dir}/report.json"
+            generate_html_report "$domain" "${domain_dir}/report.html"
+            ;;
+        *)
+            log_warn "Unknown report format: $report_format, defaulting to text"
+            generate_text_report "$domain" "${domain_dir}/report.txt"
+            ;;
+    esac
     
-        echo '  }'
-        echo '}'
-    } > "$output_file"
-
-    log_info "JSON report generated: $output_file"
-
+    log_info "Reports generated for domain: $domain"
     return 0
 }
+
+# Generate master reports
+generate_master_reports() {
+    log_info "Generating master reports"
+    
+    # Create master summary report
+    generate_master_summary "${DOMAINS[@]}" "${FSRECON_RUN_DIR}/master_summary.txt"
+    
+    log_info "Master reports generated"
+    return 0
+}
+
+# Main function
+main() {
+    display_banner
+    
+    # Parse command line arguments
+    parse_arguments "$@"
+    
+    # Display usage if no domains specified
+    if [ ${#DOMAINS[@]} -eq 0 ]; then
+        show_help
+        exit 1
+    fi
+    
+    # Initialize FSRecon
+    initialize
+    
+    log_info "Starting Full Spectrum Recon v${VERSION} on $(date)"
+    log_info "Target domains: ${DOMAINS[*]}"
+    
+    # Process each domain
+    for domain in "${DOMAINS[@]}"; do
+        process_domain "$domain"
+        generate_domain_reports "$domain"
+    done
+    
+    # Generate master reports
+    generate_master_reports
+    
+    log_info "Full Spectrum Recon completed on $(date)"
+    log_info "All results stored in: $FSRECON_RUN_DIR"
+    
+    return 0
+}
+
+# Execute main function
+main "$@"
