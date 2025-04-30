@@ -97,32 +97,54 @@ load_config() {
 }
 
 # Get configuration value
+# Prioritizes environment variables (set by flags) over config file values.
 # Usage: get_config section key [default_value]
 get_config() {
     local section="$1"
     local key="$2"
     local default="$3"
-    
+    local value=""
+
     # Make sure section and key are not empty
     if [[ -z "$section" || -z "$key" ]]; then
         echo "$default"
         return 1
     fi
-    
+
+    # Construct the variable name (e.g., SCANNING_SCAN_PORTS)
     local var_name="${section^^}_${key^^}"
-    
-    # Use parameter expansion with a default to avoid unbound variable errors
-    # ${!name} is an indirect reference, but if name is unbound it fails
-    # We need to check if the variable exists first
-    local value=""
-    if [[ -n "$var_name" ]] && [[ -v "$var_name" ]]; then
+
+    # 1. Check if the environment variable exists and is set (priority)
+    #    This handles overrides from command-line flags like --no-ports
+    if [[ -v "$var_name" ]]; then
         value="${!var_name}"
-    fi
-    
-    if [[ -z "$value" && -n "$default" ]]; then
-        echo "$default"
-    else
+        # log_debug "get_config: Found value for '$var_name' in environment: '$value'" # Optional: Add for debugging
         echo "$value"
+        return 0
+    fi
+
+    # 2. If not found in environment, check the value loaded from the config file
+    #    (This part might be less relevant now if flags directly set the env vars,
+    #     but kept for potential direct config loading scenarios)
+    #    We assume load_config has already exported variables like SCANNING_SCAN_PORTS
+    #    based on the config file if the env var wasn't set by a flag.
+    #    The check '-v "$var_name"' handles this case as well.
+
+    # 3. If still no value, use the default
+    if [[ -z "$value" && -n "$default" ]]; then
+        # log_debug "get_config: Using default value for '$var_name': '$default'" # Optional: Add for debugging
+        echo "$default"
+        return 0
+    elif [[ -n "$value" ]]; then
+         # This case covers when the value was found via -v check but might be empty string ""
+         # log_debug "get_config: Found value for '$var_name' (potentially empty): '$value'" # Optional: Add for debugging
+        echo "$value"
+        return 0
+    else
+        # Neither env var, config var, nor default exists. Return empty.
+        # log_debug "get_config: No value found for '$var_name', returning empty." # Optional: Add for debugging
+        echo ""
+        return 1 # Indicate no value found other than potentially default
     fi
 }
 
@@ -211,140 +233,33 @@ init_fsrecon() {
 }
 
 # Module registration system - simplified for better compatibility
+# Note: The primary module loading and function exporting is now handled directly in fsrecon.sh initialize function.
+# This section is kept minimal as the previous load_modules function was redundant.
 REGISTERED_MODULES=()
 REGISTERED_FUNCTIONS=()
 
-# Register a module function
+# Register a module function (Potentially deprecated if fsrecon.sh handles all exports)
 # Usage: register_function function_name description
 register_function() {
     local function_name="$1"
     local description="$2"
-    local module_name="${CURRENT_MODULE_NAME:-unknown}"
-    
+    local module_name="${CURRENT_MODULE_NAME:-unknown}" # Relies on CURRENT_MODULE_NAME being set during sourcing
+
     # Check if function exists
     if ! declare -F "$function_name" > /dev/null; then
-        echo "ERROR: Function '$function_name' does not exist in module '$module_name'"
+        log_error "Function '$function_name' does not exist in module '$module_name' at time of registration."
         return 1
     fi
-    
-    # Register function in a simpler way
+
+    # Register function name (primarily for informational purposes now)
     REGISTERED_FUNCTIONS+=("$function_name")
-    
-    # Export function to make it available to main script
-    # This is critical - we need to use the 'export -f' to make the function available globally
-    export -f "$function_name"
-    
-    echo "DEBUG: Registered function: $function_name from module $module_name"
+
+    # Export function to make it available - fsrecon.sh also does this, but belt-and-suspenders
+    export -f "$function_name" || log_warn "Failed to export function '$function_name' from core register_function."
+
+    log_debug "Registered function (core): $function_name from module $module_name"
     return 0
 }
 
-# Load all modules
-# Usage: load_modules
-load_modules() {
-    local modules_dir="${FSRECON_ROOT}/modules"
-    local loaded_modules=0
-    
-    echo "INFO: Loading modules from $modules_dir"
-    
-    # Initialize module registries
-    REGISTERED_MODULES=()
-    REGISTERED_FUNCTIONS=()
-    
-    # Ensure all modules can access necessary core functions
-    export -f get_config
-    export -f log_debug
-    export -f log_info
-    export -f log_warn
-    export -f log_error
-    
-    # Create a list of all module directories
-    module_dirs=()
-    for module_dir in "${modules_dir}"/*; do
-        if [[ -d "$module_dir" && -f "${module_dir}/main.sh" ]]; then
-            module_dirs+=("$module_dir")
-        fi
-    done
-    
-    echo "INFO: Found ${#module_dirs[@]} modules to load"
-    
-    # Load each module's main.sh file
-    for module_dir in "${module_dirs[@]}"; do
-        module_name="$(basename "$module_dir")"
-        echo "INFO: Loading module: $module_name from $module_dir/main.sh"
-        
-        # Set current module name for registration
-        export CURRENT_MODULE_NAME="$module_name"
-        
-        # Use the full path to source the module file
-        if [[ -f "${module_dir}/main.sh" ]]; then
-            echo "INFO: Sourcing ${module_dir}/main.sh"
-            # Source the module file
-            source "${module_dir}/main.sh"
-            source_result=$?
-            
-            if [[ $source_result -eq 0 ]]; then
-                # Register module in the array
-                REGISTERED_MODULES+=("$module_name")
-                
-                # Manually export key functions according to module type
-                case "$module_name" in
-                    "port")
-                        export -f port_scan 2>/dev/null || echo "WARNING: Failed to export port_scan"
-                        export -f port_parse_results 2>/dev/null || echo "WARNING: Failed to export port_parse_results"
-                        ;;
-                    "subdomain")
-                        export -f subdomain_scan 2>/dev/null || echo "WARNING: Failed to export subdomain_scan"
-                        ;;
-                    "http")
-                        export -f http_probe 2>/dev/null || echo "WARNING: Failed to export http_probe"
-                        export -f http_parse_results 2>/dev/null || echo "WARNING: Failed to export http_parse_results"
-                        ;;
-                    "path")
-                        export -f path_discover 2>/dev/null || echo "WARNING: Failed to export path_discover"
-                        ;;
-                    "screenshot")
-                        export -f screenshot_capture 2>/dev/null || echo "WARNING: Failed to export screenshot_capture"
-                        ;;
-                    "vuln")
-                        export -f vuln_scan 2>/dev/null || echo "WARNING: Failed to export vuln_scan"
-                        ;;
-                esac
-                
-                # Call module initialization function if it exists
-                if declare -F "${module_name}_init" > /dev/null; then
-                    echo "INFO: Initializing module: $module_name"
-                    "${module_name}_init" || echo "WARNING: Failed to initialize $module_name"
-                fi
-                
-                # Call module registration function if it exists - this should be handled by the export above
-                # but we're double-checking
-                if declare -F "module_register" > /dev/null; then
-                    echo "INFO: Running module_register for: $module_name"
-                    module_register || echo "WARNING: Failed to register functions for $module_name"
-                fi
-                
-                loaded_modules=$((loaded_modules + 1))
-                echo "INFO: Module loaded successfully: $module_name"
-            else
-                echo "ERROR: Failed to source module: $module_name with exit code $source_result"
-            fi
-        else
-            echo "ERROR: Module file not found for $module_name at ${module_dir}/main.sh"
-        fi
-        
-        # Clear current module name
-        unset CURRENT_MODULE_NAME
-    done
-    
-    # Verify essential functions are available
-    for func in "port_scan" "subdomain_scan" "http_probe" "path_discover" "screenshot_capture" "vuln_scan"; do
-        if ! declare -F "$func" > /dev/null; then
-            log_warn "Function '$func' is not available. Some features may not work."
-        else
-            log_debug "Function '$func' is available."
-        fi
-    done
-    
-    log_info "Loaded $loaded_modules modules"
-    return 0
-}
+# Note: The load_modules function previously here has been removed as its logic
+# was duplicated and handled more directly within the initialize function in fsrecon.sh.
