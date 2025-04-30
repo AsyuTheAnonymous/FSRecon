@@ -44,16 +44,41 @@ load_config() {
         key=$(echo "$key" | xargs)
         value=$(echo "$value" | xargs)
         
-        # Expand variables in value carefully
-        # First, check if the value contains any variable references
-        if [[ "$value" == *'${'*'}'* ]]; then
-            # Make sure CONFIG_FILE is an absolute path to ensure eval works correctly
-            cd "$(dirname "$CONFIG_FILE")" || true
-            # Use eval with a safe pattern
-            # If variable expansion fails, keep the original value
-            eval "expanded_value=\"$value\"" 2>/dev/null || expanded_value="$value"
-            value="$expanded_value"
-        fi
+        # Expand variables in value safely without eval
+        # Look for patterns like ${variable_name}
+        while [[ "$value" =~ (\$\{([a-zA-Z_][a-zA-Z0-9_]*)\}) ]]; do
+            local full_match="${BASH_REMATCH[0]}" # e.g., ${wordlist_dir}
+            local var_key="${BASH_REMATCH[2]}"    # e.g., wordlist_dir
+            
+            # Construct potential exported variable names (assuming it might be global or section-specific)
+            local potential_var_name_global="${var_key^^}"
+            local potential_var_name_section="${section^^}_${var_key^^}"
+            
+            local replacement_value=""
+            
+            # Check if the section-specific variable exists
+            if [[ -v "$potential_var_name_section" ]]; then
+                replacement_value="${!potential_var_name_section}"
+            # Check if the global-like variable exists (might be from [general] or no section)
+            elif [[ -v "$potential_var_name_global" ]]; then
+                 replacement_value="${!potential_var_name_global}"
+            else
+                # Check if a variable from the [general] section matches
+                local general_var_name="GENERAL_${var_key^^}"
+                if [[ -v "$general_var_name" ]]; then
+                    replacement_value="${!general_var_name}"
+                else
+                    log_warn "Variable expansion failed: Cannot find value for '$var_key' in config value '$value'"
+                    # Keep the original placeholder if var not found to avoid breaking paths.
+                    replacement_value="$full_match" 
+                    break # Avoid infinite loop if substitution fails
+                fi
+            fi
+            
+            # Perform substitution - use Bash parameter expansion for safety
+            value="${value//$full_match/$replacement_value}"
+            log_debug "Expanded variable $full_match to $replacement_value in value. New value: $value"
+        done
         
         # Create variable name
         if [[ -n "$section" ]]; then
@@ -185,28 +210,138 @@ init_fsrecon() {
     return 0
 }
 
+# Module registration system - simplified for better compatibility
+REGISTERED_MODULES=()
+REGISTERED_FUNCTIONS=()
+
+# Register a module function
+# Usage: register_function function_name description
+register_function() {
+    local function_name="$1"
+    local description="$2"
+    local module_name="${CURRENT_MODULE_NAME:-unknown}"
+    
+    # Check if function exists
+    if ! declare -F "$function_name" > /dev/null; then
+        echo "ERROR: Function '$function_name' does not exist in module '$module_name'"
+        return 1
+    fi
+    
+    # Register function in a simpler way
+    REGISTERED_FUNCTIONS+=("$function_name")
+    
+    # Export function to make it available to main script
+    # This is critical - we need to use the 'export -f' to make the function available globally
+    export -f "$function_name"
+    
+    echo "DEBUG: Registered function: $function_name from module $module_name"
+    return 0
+}
+
 # Load all modules
 # Usage: load_modules
 load_modules() {
     local modules_dir="${FSRECON_ROOT}/modules"
     local loaded_modules=0
     
-    log_info "Loading modules..."
+    echo "INFO: Loading modules from $modules_dir"
     
-    # Load each module's main.sh file
+    # Initialize module registries
+    REGISTERED_MODULES=()
+    REGISTERED_FUNCTIONS=()
+    
+    # Ensure all modules can access necessary core functions
+    export -f get_config
+    export -f log_debug
+    export -f log_info
+    export -f log_warn
+    export -f log_error
+    
+    # Create a list of all module directories
+    module_dirs=()
     for module_dir in "${modules_dir}"/*; do
         if [[ -d "$module_dir" && -f "${module_dir}/main.sh" ]]; then
-            module_name="$(basename "$module_dir")"
-            log_debug "Loading module: $module_name"
-            
+            module_dirs+=("$module_dir")
+        fi
+    done
+    
+    echo "INFO: Found ${#module_dirs[@]} modules to load"
+    
+    # Load each module's main.sh file
+    for module_dir in "${module_dirs[@]}"; do
+        module_name="$(basename "$module_dir")"
+        echo "INFO: Loading module: $module_name from $module_dir/main.sh"
+        
+        # Set current module name for registration
+        export CURRENT_MODULE_NAME="$module_name"
+        
+        # Use the full path to source the module file
+        if [[ -f "${module_dir}/main.sh" ]]; then
+            echo "INFO: Sourcing ${module_dir}/main.sh"
+            # Source the module file
             source "${module_dir}/main.sh"
+            source_result=$?
             
-            if [[ $? -eq 0 ]]; then
+            if [[ $source_result -eq 0 ]]; then
+                # Register module in the array
+                REGISTERED_MODULES+=("$module_name")
+                
+                # Manually export key functions according to module type
+                case "$module_name" in
+                    "port")
+                        export -f port_scan 2>/dev/null || echo "WARNING: Failed to export port_scan"
+                        export -f port_parse_results 2>/dev/null || echo "WARNING: Failed to export port_parse_results"
+                        ;;
+                    "subdomain")
+                        export -f subdomain_scan 2>/dev/null || echo "WARNING: Failed to export subdomain_scan"
+                        ;;
+                    "http")
+                        export -f http_probe 2>/dev/null || echo "WARNING: Failed to export http_probe"
+                        export -f http_parse_results 2>/dev/null || echo "WARNING: Failed to export http_parse_results"
+                        ;;
+                    "path")
+                        export -f path_discover 2>/dev/null || echo "WARNING: Failed to export path_discover"
+                        ;;
+                    "screenshot")
+                        export -f screenshot_capture 2>/dev/null || echo "WARNING: Failed to export screenshot_capture"
+                        ;;
+                    "vuln")
+                        export -f vuln_scan 2>/dev/null || echo "WARNING: Failed to export vuln_scan"
+                        ;;
+                esac
+                
+                # Call module initialization function if it exists
+                if declare -F "${module_name}_init" > /dev/null; then
+                    echo "INFO: Initializing module: $module_name"
+                    "${module_name}_init" || echo "WARNING: Failed to initialize $module_name"
+                fi
+                
+                # Call module registration function if it exists - this should be handled by the export above
+                # but we're double-checking
+                if declare -F "module_register" > /dev/null; then
+                    echo "INFO: Running module_register for: $module_name"
+                    module_register || echo "WARNING: Failed to register functions for $module_name"
+                fi
+                
                 loaded_modules=$((loaded_modules + 1))
-                log_debug "Module loaded: $module_name"
+                echo "INFO: Module loaded successfully: $module_name"
             else
-                log_error "Failed to load module: $module_name"
+                echo "ERROR: Failed to source module: $module_name with exit code $source_result"
             fi
+        else
+            echo "ERROR: Module file not found for $module_name at ${module_dir}/main.sh"
+        fi
+        
+        # Clear current module name
+        unset CURRENT_MODULE_NAME
+    done
+    
+    # Verify essential functions are available
+    for func in "port_scan" "subdomain_scan" "http_probe" "path_discover" "screenshot_capture" "vuln_scan"; do
+        if ! declare -F "$func" > /dev/null; then
+            log_warn "Function '$func' is not available. Some features may not work."
+        else
+            log_debug "Function '$func' is available."
         fi
     done
     

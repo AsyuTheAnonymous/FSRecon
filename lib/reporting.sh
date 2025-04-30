@@ -146,7 +146,7 @@ generate_json_report() {
             echo '      "found": true,'
             echo '      "data": '
             cat "${domain_dir}/path/paths_discovered.json"
-        } else if [[ -f "${domain_dir}/path/paths_discovered.txt" ]]; then
+        elif [[ -f "${domain_dir}/path/paths_discovered.txt" ]]; then # Corrected 'else if' to 'elif'
             echo '      "found": true,'
             echo '      "count": '"$(grep -v "^$" "${domain_dir}/path/paths_discovered.txt" | wc -l)"','
             echo '      "data": ['
@@ -191,7 +191,7 @@ generate_json_report() {
             echo '      "found": true,'
             echo '      "data": '
             cat "${domain_dir}/vuln/vulnerabilities.json"
-        } else if [[ -f "${domain_dir}/vuln/vulnerabilities.txt" ]]; then
+        elif [[ -f "${domain_dir}/vuln/vulnerabilities.txt" ]]; then # Corrected 'else if' to 'elif'
             echo '      "found": true,'
             echo '      "count": '"$(wc -l < "${domain_dir}/vuln/vulnerabilities.txt")"','
             echo '      "data": ['
@@ -488,8 +488,20 @@ generate_html_report() {
     return 0
 }
 
-# Export functions
-export -f generate_text_report
-export -f generate_json_report
-export -f generate_master_summary
-export -f generate_html_report
+# Register module functions
+module_register() {
+    register_function "generate_text_report" "Generate a text report for a domain"
+    register_function "generate_json_report" "Generate a JSON report for a domain"
+    register_function "generate_html_report" "Generate an HTML report for a domain"
+    register_function "generate_master_summary" "Generate a master summary report for all domains"
+}
+
+# Initialize reporting module
+reporting_init() {
+    log_debug "Initializing reporting module"
+    log_debug "Reporting module initialized"
+    return 0
+}
+
+# Initialize module
+reporting_init
