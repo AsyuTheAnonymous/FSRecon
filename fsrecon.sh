@@ -6,6 +6,8 @@
 # - Wayback param keys; JS/endpoint harvest; historical split (.js/.php/.aspx/.jsp).
 # - Optional HTML dashboard: --report-html (offline).
 # - Centralized tool commands/flags at the top.
+# - ### PERF: Added parallelization (background jobs + wait, xargs -P), isolated outputs,
+#            and targeted Nmap scanning on RustScan-open ports.
 
 set -uo pipefail
 
@@ -38,7 +40,7 @@ TOOL_RUSTSCAN="rustscan"
 RUSTSCAN_FLAGS="--ulimit 5000 -g"
 
 TOOL_NMAP="nmap"
-NMAP_FLAGS="-Pn -sV --top-ports 1000"
+NMAP_FLAGS="-Pn -sV"  # ### PERF: let RustScan pick ports; we avoid blanket --top-ports here
 
 TOOL_KATANA="katana"
 KATANA_FLAGS="-jc -fx -d 2"
@@ -159,25 +161,52 @@ host_scope_keep(){
 enum_subdomains(){
   local T="$1" SD="$OUTBASE/$T/recon/subdomains" LOG="$OUTBASE/$T/recon/logs/subdomains.log"
   info "$T :: subdomain enumeration"
+  mkdir -p "$SD"
+  :> "$SD/subfinder.txt"; :> "$SD/assetfinder.txt"; :> "$SD/amass.txt" 2>/dev/null || true
   :> "$SD/raw.txt"
 
-  command -v "${TOOL_SUBFINDER%% *}" >/dev/null && run "$TOOL_SUBFINDER $SUBFINDER_FLAGS -d '$T' $(tee_to "$SD/raw.txt") || true" "$LOG"
-  command -v "${TOOL_ASSETFINDER%% *}" >/dev/null && run "$TOOL_ASSETFINDER $ASSETFINDER_FLAGS '$T' $(tee_to "$SD/raw.txt") || true" "$LOG"
+  # ### PERF: run finders in parallel, isolate outputs, then merge
+  local pids=()
+
+  if command -v "${TOOL_SUBFINDER%% *}" >/dev/null; then
+    (
+      if [[ $DEBUG -eq 1 || $VERBOSE -eq 1 ]]; then echo ">> $TOOL_SUBFINDER $SUBFINDER_FLAGS -d '$T'"; fi
+      [[ $DRYRUN -eq 1 ]] && exit 0
+      $TOOL_SUBFINDER $SUBFINDER_FLAGS -d "$T" 2>>"$LOG" | sed '/^\s*$/d' | sort -u > "$SD/subfinder.txt"
+    ) & pids+=($!)
+  fi
+
+  if command -v "${TOOL_ASSETFINDER%% *}" >/dev/null; then
+    (
+      if [[ $DEBUG -eq 1 || $VERBOSE -eq 1 ]]; then echo ">> $TOOL_ASSETFINDER $ASSETFINDER_FLAGS '$T'"; fi
+      [[ $DRYRUN -eq 1 ]] && exit 0
+      $TOOL_ASSETFINDER $ASSETFINDER_FLAGS "$T" 2>>"$LOG" | sed '/^\s*$/d' | sort -u > "$SD/assetfinder.txt"
+    ) & pids+=($!)
+  fi
+
   if [[ "$USE_AMASS" == true ]] && command -v "${TOOL_AMASS%% *}" >/dev/null; then
-    if [[ -n "${AMASS_TO:-}" ]]; then
-      run "timeout ${AMASS_TO}s $TOOL_AMASS $AMASS_ENUM_FLAGS -d '$T' $(tee_to "$SD/raw.txt") || true" "$LOG"
-    else
-      run "$TOOL_AMASS $AMASS_ENUM_FLAGS -d '$T' $(tee_to "$SD/raw.txt") || true" "$LOG"
-    fi
+    (
+      if [[ $DEBUG -eq 1 || $VERBOSE -eq 1 ]]; then echo ">> $TOOL_AMASS $AMASS_ENUM_FLAGS -d '$T'"; fi
+      [[ $DRYRUN -eq 1 ]] && exit 0
+      if [[ -n "${AMASS_TO:-}" ]]; then
+        timeout "${AMASS_TO}s" $TOOL_AMASS $AMASS_ENUM_FLAGS -d "$T" 2>>"$LOG" | sed '/^\s*$/d' | sort -u > "$SD/amass.txt" || true
+      else
+        $TOOL_AMASS $AMASS_ENUM_FLAGS -d "$T" 2>>"$LOG" | sed '/^\s*$/d' | sort -u > "$SD/amass.txt"
+      fi
+    ) & pids+=($!)
   else
     info "$T :: skipping amass (opt-in only)"
   fi
 
-  run "sort -u '$SD/raw.txt' | sed '/^\\s*$/d' > '$SD/all.txt'"
-
+  # seeds (sync, tiny) — no need to parallelize
   local SEED="$OUTBASE/$T/recon/seeds/targets.txt"
-  [[ -s "$SEED" ]] && { run "sed 's/^[[:space:]]*//' \"$SEED\" | grep -E '^[A-Za-z0-9.-]+$' >> \"$SD/all.txt\" || true" "$LOG"; run "sort -u \"$SD/all.txt\" -o \"$SD/all.txt\""; }
+  [[ -s "$SEED" ]] && run "sed 's/^[[:space:]]*//' \"$SEED\" | grep -E '^[A-Za-z0-9.-]+$' >> \"$SD/raw.txt\" || true" "$LOG"
 
+  # wait for parallel finders
+  [[ ${#pids[@]} -gt 0 ]] && wait "${pids[@]}"
+
+  # merge & scope
+  run "cat \"$SD\"/subfinder.txt \"$SD\"/assetfinder.txt \"$SD\"/amass.txt \"$SD\"/raw.txt 2>/dev/null | sed '/^\\s*$/d' | sort -u > \"$SD/all.txt\""
   if [[ "$STRICT_SCOPE" == true ]]; then
     run "host_scope_keep '$T' < '$SD/all.txt' | sort -u > '$SD/all_scoped.txt'"
   else
@@ -233,17 +262,45 @@ scan_ports(){
   local T="$1" SD="$OUTBASE/$T/recon/subdomains" PD="$OUTBASE/$T/recon/ports" LOG="$OUTBASE/$T/recon/logs/ports.log"
   [[ "$PORTS" -eq 1 ]] || { info "$T :: port scanning skipped"; return; }
   [[ -s "$SD/live.txt" ]] || { info "$T :: no live URLs for port scan"; return; }
+  run "mkdir -p '$PD'"
 
-  info "$T :: rustscan fast ports"; run ": > '$PD/rustscan.txt'"
+  info "$T :: rustscan fast ports"
+  : > "$PD/rustscan.txt"
   if command -v "${TOOL_RUSTSCAN%% *}" >/dev/null; then
-    run "sed 's#^https\\?://##' '$SD/live.txt' | awk -F/ '{print \$1}' | sort -u | \
+    # scan hosts in parallel via xargs
+    run "sed 's#^https\\?://##' '$SD/live.txt' | awk -F/ '{print \$1}' | cut -d: -f1 | sort -u | \
 xargs -I{} -P '$THREADS' bash -c '$TOOL_RUSTSCAN $RUSTSCAN_FLAGS -a \"{}\" || true' $(tee_to "$PD/rustscan.txt")" "$LOG"
   fi
 
-  info "$T :: nmap service/version"; run ": > '$PD/nmap.txt'"
-  if command -v "${TOOL_NMAP%% *}" >/dev/null; then
+  # ### PERF: Build per-host open-port map, then run Nmap per host in parallel
+  info "$T :: parsing rustscan results -> targeted nmap"
+  : > "$PD/nmap.txt"
+  : > "$PD/rs_open_ports.txt"
+
+  if grep -q '^Open ' "$PD/rustscan.txt" 2>/dev/null; then
+    awk '/^Open /{print $2}' "$PD/rustscan.txt" | awk -F: '{h=$1;p=$2;g[h]=g[h] (g[h]?"," :"") p} END{for(h in g) print h" "g[h]}' > "$PD/rs_open_ports.txt"
+  fi
+
+  if [[ -s "$PD/rs_open_ports.txt" ]] && command -v "${TOOL_NMAP%% *}" >/dev/null; then
+    info "$T :: nmap service/version (per-host, open ports only)"
+    local npids=()
+    while read -r host ports; do
+      [[ -z "${host// }" || -z "${ports// }" ]] && continue
+      (
+        if [[ $DEBUG -eq 1 || $VERBOSE -eq 1 ]]; then echo ">> $TOOL_NMAP $NMAP_FLAGS -p $ports $host"; fi
+        [[ $DRYRUN -eq 1 ]] && exit 0
+        safe="${host//[:\/]/_}"
+        $TOOL_NMAP -p "$ports" $NMAP_FLAGS "$host" -oN "$PD/nmap_$safe.txt" 2>>"$LOG" || true
+      ) & npids+=($!)
+    done < "$PD/rs_open_ports.txt"
+    [[ ${#npids[@]} -gt 0 ]] && wait "${npids[@]}"
+    # merge per-host outputs (safe, no concurrent writes)
+    cat "$PD"/nmap_*.txt 2>/dev/null >> "$PD/nmap.txt" || true
+  else
+    # fallback if rustscan produced nothing useful
+    info "$T :: nmap fallback (--top-ports 1000)"
     run "sed 's#^https\\?://##' '$SD/live.txt' | awk -F/ '{print \$1}' | cut -d: -f1 | sort -u > '$PD/hosts.txt'"
-    run "$TOOL_NMAP -iL '$PD/hosts.txt' $NMAP_FLAGS -oN '$PD/nmap.txt' || true" "$LOG"
+    run "$TOOL_NMAP -iL '$PD/hosts.txt' -Pn -sV --top-ports 1000 -oN '$PD/nmap.txt' || true" "$LOG"
   fi
 }
 
@@ -254,12 +311,17 @@ dir_bust(){
   [[ -s "$SD/live.txt" ]] || { info "$T :: no live URLs for dir bust"; return; }
   [[ -f "$WORDLIST" ]] || die "wordlist not found: $WORDLIST"
 
-  info "$T :: content discovery (feroxbuster)"; run "mkdir -p '$DD'"
-  while read -r url; do
-    [[ -z "${url// }" ]] && continue
-    safe=$(echo "$url" | sed "s#https\\?://##; s#[/:]#_#g")
-    run "$TOOL_FEROX -u '$url' -w '$WORDLIST' $FEROX_FLAGS -o '$DD/$safe.txt' || true" "$LOG"
-  done < "$SD/live.txt"
+  info "$T :: content discovery (feroxbuster)"
+  run "mkdir -p '$DD'"
+  # ### PERF: parallelize ferox per-URL with xargs -P, one output per target
+  if command -v "${TOOL_FEROX%% *}" >/dev/null; then
+    xargs -P "$THREADS" -I{} sh -c '
+      url="$1"
+      [ -z "${url// }" ] && exit 0
+      safe=$(echo "$url" | sed "s#https\\?://##; s#[/:]#_#g")
+      '"$TOOL_FEROX"' -u "$url" -w "'"$WORDLIST"'" '"$FEROX_FLAGS"' -o "'"$DD"'/$safe.txt" || true
+    ' sh < "$SD/live.txt" >>"$LOG" 2>&1
+  fi
 }
 
 # ---------- historicals ----------
@@ -320,15 +382,13 @@ js_harvest(){
   local T="$1" SD="$OUTBASE/$T/recon/subdomains" AD="$OUTBASE/$T/recon/artifacts" HD="$OUTBASE/$T/recon/historical" LOG="$OUTBASE/$T/recon/logs/js-harvest.log"
   [[ "$SKIP_JS" == true ]] && { info "$T :: skipping JS/endpoint harvest (by flag)"; return; }
   info "$T :: JS & endpoint harvest (katana)"; run "mkdir -p '$AD'"
-  run ": > '$AD/katana-all.txt' ; : > '$AD/js-files.txt' ; : > '$AD/js-endpoints.txt'"
+  : > "$AD/katana-all.txt" ; : > "$AD/js-files.txt" ; : > "$AD/js-endpoints.txt"
 
   command -v "${TOOL_KATANA%% *}" >/dev/null || { info "katana not installed; skipping JS harvest"; return; }
 
+  # ### PERF: use katana -list to crawl all live hosts in one (internally parallel) run
   if [[ -s "$SD/live.txt" ]]; then
-    while read -r u; do
-      [[ -z "${u// }" ]] && continue
-      run "$TOOL_KATANA -u '$u' $KATANA_FLAGS $(sflag) >> '$AD/katana-all.txt' || true" "$LOG"
-    done < "$SD/live.txt"
+    run "$TOOL_KATANA -list '$SD/live.txt' $KATANA_FLAGS -o '$AD/katana-all.txt' || true" "$LOG"
   fi
 
   if [[ "$STRICT_SCOPE" == true ]]; then
@@ -524,12 +584,24 @@ run_target(){
 
   enum_subdomains "$T"
   probe_live "$T"
-  [[ "$SHOTS" -eq 1 ]] && shoot "$T" || true
-  [[ "$PORTS" -eq 1 ]] && scan_ports "$T" || true
-  dir_bust "$T"
+
+  # ### PERF: Run independent modules concurrently; respect dependencies:
+  # - Start shots/ports/ferox in background.
+  # - Run historicals (foreground), then params (needs historicals), then js_harvest.
+  local bg_pids=()
+
+  [[ "$SHOTS" -eq 1 ]] && { shoot "$T" & bg_pids+=($!); }
+  [[ "$PORTS" -eq 1 ]] && { scan_ports "$T" & bg_pids+=($!); }
+  dir_bust "$T" & bg_pids+=($!)
+
+  # historicals -> params -> js_harvest (sequential to leverage historicals output)
   historicals "$T"
   params "$T"
   js_harvest "$T"
+
+  # wait for background jobs to finish before summary/report
+  [[ ${#bg_pids[@]} -gt 0 ]] && wait "${bg_pids[@]}"
+
   [[ "$SUMMARY" -eq 1 ]] && summarize "$T" || true
   [[ "$REPORT_HTML" -eq 1 ]] && report_html "$T" || true
 
@@ -549,9 +621,47 @@ run_target(){
   echo
 }
 
+usage() {
+  cat <<EOF
+Usage: $0 [options]
+
+Options:
+  -d, --domain <domain>       Run recon on a single domain
+  -f, --file <file>           Run recon on a list of domains (one per line)
+
+General:
+  --threads <n>               Set number of threads (default: 10)
+  --wordlist <path>           Path to ferox wordlist
+  --out <dir>                 Base output directory (default: .)
+
+Toggles:
+  --skip-shots                Skip screenshots
+  --skip-ports                Skip port scanning
+  --no-ferox                  Skip feroxbuster content discovery
+  --no-params                 Skip parameter discovery
+  --no-js                     Skip JS/endpoint harvest
+  --amass                     Enable amass passive enumeration
+  --summarize                 Write summary.md
+  --report-html               Generate HTML report
+  --no-strict-scope           Disable strict scope filtering
+
+Other:
+  --scope-file <file>         Scope file (in-scope domains)
+  --oos-file <file>           Out-of-scope file
+  --scope <file>              Iterate through file + apply as scope
+  --fast                      Fast triage preset (threads=50, no shots, skip ferox)
+  --debug                     Print commands as they run
+  --dry-run                   Parse options only, don’t execute
+  -v, --verbose               Verbose logging
+  -h, --help                  Show this help
+
+EOF
+}
+
 main(){
   check_tools
   local TARGET="" FILE=""
+
   while [[ $# -gt 0 ]]; do
     case "$1" in
       -d|--domain) TARGET="$2"; shift 2;;
@@ -571,10 +681,11 @@ main(){
       --oos-file)  OOS_FILE="$2"; shift 2;;
       --scope) SCOPE_ITER_FILE="$2"; shift 2;;
       --no-strict-scope) STRICT_SCOPE=false; shift;;
+      --fast)      THREADS=50; SHOTS=0; SKIP_FEROX=true; info "FAST mode: threads=50, no shots, skip ferox"; shift;;
       --debug) DEBUG=1; shift;;
       --dry-run) DRYRUN=1; shift;;
       -v|--verbose) VERBOSE=1; shift;;
-      -h|--help) sed -n '1,400p' "$0"; exit 0;;
+      -h|--help) usage; exit 0;;
       *) die "unknown arg: $1";;
     esac
   done
@@ -598,5 +709,6 @@ main(){
     done < "$FILE"
   fi
 }
+
 
 main "$@"
